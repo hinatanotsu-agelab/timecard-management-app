@@ -1,0 +1,892 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuth } from '@/contexts/AuthContext';
+import { collection, doc, serverTimestamp, query, where, getDocs, updateDoc, addDoc, deleteDoc, orderBy } from 'firebase/firestore';
+import { db } from '@/lib/firebase';
+import { Timestamp } from 'firebase/firestore';
+import JapaneseHolidays from 'japanese-holidays';
+
+type ViewMode = 'day' | 'week' | 'month';
+
+interface ShiftEntry {
+  id?: string;
+  date: string; // YYYY-MM-DD
+  startTime: string; // HH:mm
+  endTime: string; // HH:mm
+  note?: string;
+  persisted?: boolean;
+}
+
+export default function ShiftSubmitPage() {
+  const { userProfile } = useAuth();
+  const router = useRouter();
+  const [viewMode, setViewMode] = useState<ViewMode>('month');
+  const [currentDate, setCurrentDate] = useState(new Date());
+  const [targetMonth, setTargetMonth] = useState(new Date());
+  const [shifts, setShifts] = useState<ShiftEntry[]>([]);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [isAddingShift, setIsAddingShift] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [newShift, setNewShift] = useState<ShiftEntry>({
+    date: '',
+    startTime: '09:00',
+    endTime: '18:00',
+    note: '',
+  });
+
+
+
+  // 提出期限チェック（各ターゲット月の直前月25日12時まで）
+  const canSubmitForMonth = (targetDate: Date): boolean => {
+    const now = new Date();
+    const targetYear = targetDate.getFullYear();
+    const targetMonth = targetDate.getMonth();
+    // ターゲット月の直前月25日12:00が締切
+    // 例：11月の締切は10/25 12:00、1月の締切は前年12/25 12:00
+    const deadline = new Date(targetYear, targetMonth - 1, 25, 12, 0, 0);
+    return now.getTime() <= deadline.getTime();
+  };
+
+  // 表示モードに応じて判定対象の日付を切り替え
+  const displayDateForLock = viewMode === 'month' ? targetMonth : currentDate;
+  const isSubmissionLocked = !canSubmitForMonth(displayDateForLock);
+
+  // 日付単位の提出可否（週/日ビュー用）
+  const canSubmitForDate = (date: Date): boolean => {
+    return canSubmitForMonth(date);
+  };
+
+  // 提出期限までの残り時間を表示（基準となる日付を引数に取る）
+  const getDeadlineMessageFor = (baseDate: Date): string => {
+    const now = new Date();
+    const y = baseDate.getFullYear();
+    const m = baseDate.getMonth();
+    const deadline = new Date(y, m - 1, 25, 12, 0, 0);
+
+    if (now.getTime() > deadline.getTime()) {
+      const displayY = y;
+      const displayM = m + 1; // 人間向け表示
+      return `${displayY}年${displayM}月の提出期限（前月25日12時）は過ぎています`;
+    }
+
+    const diffMs = deadline.getTime() - now.getTime();
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+    const diffHours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+    return `提出期限（前月25日12時）まで残り${diffDays}日${diffHours}時間`;
+  };
+
+  useEffect(() => {
+    if (!userProfile?.currentOrganizationId) {
+      router.push('/dashboard/part-time');
+      return;
+    }
+    // 所属チェック：選択中の組織が自分の所属に含まれていない場合は組織参加ページへ誘導
+    const orgId = userProfile.currentOrganizationId;
+    const belongs = Array.isArray(userProfile.organizationIds) && userProfile.organizationIds.includes(orgId);
+    if (!belongs) {
+      router.push('/join-organization');
+    }
+  }, [userProfile, router]);
+
+  // 表示月のシフトを読み込む関数
+  const loadMonthShifts = async (baseDate: Date) => {
+    if (!userProfile?.uid || !userProfile?.currentOrganizationId) return;
+
+    const y = baseDate.getFullYear();
+    const m = baseDate.getMonth();
+    const monthStart = new Date(y, m, 1, 0, 0, 0, 0);
+    const nextMonthStart = new Date(y, m + 1, 1, 0, 0, 0, 0);
+
+    const usersRef = doc(db, 'users', userProfile.uid);
+
+    // サーバー側で月範囲フィルタ（index前提）
+    const q = query(
+      collection(db, 'shifts'),
+      where('organizationId', '==', userProfile.currentOrganizationId),
+      where('userRef', '==', usersRef),
+      where('date', '>=', Timestamp.fromDate(monthStart)),
+      where('date', '<', Timestamp.fromDate(nextMonthStart)),
+      orderBy('date', 'asc')
+    );
+    const snap = await getDocs(q);
+
+    const loaded: ShiftEntry[] = snap.docs
+      .map((d) => {
+        const data = d.data() as any;
+        const dateTs: Timestamp = data.date;
+        const dt = dateTs.toDate();
+        const yyyy = dt.getFullYear();
+        const mm = (dt.getMonth() + 1).toString().padStart(2, '0');
+        const dd = dt.getDate().toString().padStart(2, '0');
+        return {
+          id: d.id,
+          date: `${yyyy}-${mm}-${dd}`,
+          startTime: data.startTime,
+          endTime: data.endTime,
+          note: data.note || '',
+          persisted: true,
+        } as ShiftEntry;
+      })
+      ;
+
+    setShifts(loaded);
+  };
+
+  // 初期表示と月が変わったときに読み込み
+  useEffect(() => {
+    loadMonthShifts(currentDate);
+  }, [userProfile?.uid, userProfile?.currentOrganizationId, currentDate.getFullYear(), currentDate.getMonth()]);
+
+  // カレンダー表示用の日付配列を生成
+  const getCalendarDays = (date: Date): Date[] => {
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const startDate = new Date(firstDay);
+    startDate.setDate(startDate.getDate() - firstDay.getDay()); // 日曜日から開始
+
+    const days: Date[] = [];
+    const current = new Date(startDate);
+
+    while (days.length < 42) { // 6週間分
+      days.push(new Date(current));
+      current.setDate(current.getDate() + 1);
+    }
+
+    return days;
+  };
+
+  // 週表示用の日付配列を生成
+  const getWeekDays = (date: Date): Date[] => {
+    const days: Date[] = [];
+    const current = new Date(date);
+    current.setDate(current.getDate() - current.getDay()); // 日曜日に移動
+
+    for (let i = 0; i < 7; i++) {
+      days.push(new Date(current));
+      current.setDate(current.getDate() + 1);
+    }
+
+    return days;
+  };
+
+  // 時間軸の配列を生成（0-23時）
+  const getHourLabels = (): string[] => {
+    return Array.from({ length: 24 }, (_, i) => `${i.toString().padStart(2, '0')}:00`);
+  };
+
+  // 日付文字列をフォーマット
+  const formatDate = (date: Date): string => {
+    const year = date.getFullYear();
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const day = date.getDate().toString().padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
+  // 日付の比較
+  const isSameDate = (date1: Date, date2: Date): boolean => {
+    return formatDate(date1) === formatDate(date2);
+  };
+
+  // その日のシフトを取得
+  const getShiftsForDate = (date: string): ShiftEntry[] => {
+    return shifts.filter(shift => shift.date === date);
+  };
+
+  // シフト追加
+  const handleAddShift = () => {
+    if (!selectedDate || isSubmissionLocked) return;
+
+    setNewShift({
+      date: selectedDate,
+      startTime: '09:00',
+      endTime: '18:00',
+      note: '',
+    });
+    setIsAddingShift(true);
+  };
+
+  // シフト保存（即座にFirestoreへ）
+  const handleSaveShift = async () => {
+    if (!userProfile?.uid || !userProfile?.currentOrganizationId) {
+      alert('ユーザーまたは所属組織が特定できません');
+      return;
+    }
+
+    // 追加の所属チェック（ルール前に早期リターン）
+    const orgId = userProfile.currentOrganizationId;
+    const belongs = Array.isArray(userProfile.organizationIds) && userProfile.organizationIds.includes(orgId);
+    if (!belongs) {
+      alert('選択中の企業に未所属のためシフトを登録できません。企業IDの参加を完了してください。');
+      router.push('/join-organization');
+      return;
+    }
+
+    if (!newShift.date || !newShift.startTime || !newShift.endTime) return;
+
+    // 時間の妥当性チェック
+    if (newShift.startTime >= newShift.endTime) {
+      alert('終了時刻は開始時刻より後にしてください');
+      return;
+    }
+
+    // 締切チェック
+    if (!canSubmitForDate(new Date(newShift.date))) {
+      alert('この日のシフトは締切を過ぎているため追加できません');
+      return;
+    }
+
+    // 既存のシフトと重複チェック
+    const dateShifts = getShiftsForDate(newShift.date);
+    const hasOverlap = dateShifts.some(shift => {
+      return !(newShift.endTime <= shift.startTime || newShift.startTime >= shift.endTime);
+    });
+
+    if (hasOverlap) {
+      alert('この時間帯は既にシフトが入っています');
+      return;
+    }
+
+    try {
+      const usersRef = doc(db, 'users', userProfile.uid);
+      const [y, m, d] = newShift.date.split('-').map((v) => parseInt(v, 10));
+      const dateTs = Timestamp.fromDate(new Date(y, m - 1, d, 0, 0, 0));
+
+      console.log('[Debug] Shift creation attempt:', {
+        organizationId: userProfile.currentOrganizationId,
+        userRefPath: usersRef.path,
+        userId: userProfile.uid,
+        date: dateTs,
+        userOrganizationIds: userProfile.organizationIds,
+        currentOrganizationId: userProfile.currentOrganizationId,
+      });
+
+      const docRef = await addDoc(collection(db, 'shifts'), {
+        organizationId: userProfile.currentOrganizationId,
+        userRef: usersRef,
+        createdTime: serverTimestamp(),
+        date: dateTs,
+        startTime: newShift.startTime,
+        endTime: newShift.endTime,
+        note: newShift.note ?? '',
+        status: 'pending',
+        approvedBy: null,
+        approvedAt: null,
+        rejectReason: null,
+      });
+
+      console.log('[Debug] Shift created successfully:', docRef.id);
+
+      // ローカル状態に反映
+      setShifts([...shifts, { ...newShift, id: docRef.id, persisted: true }]);
+      setIsAddingShift(false);
+      setNewShift({
+        date: '',
+        startTime: '09:00',
+        endTime: '18:00',
+        note: '',
+      });
+    } catch (e) {
+      console.error('[Debug] Shift creation failed:', e);
+      alert('シフトの追加に失敗しました');
+    }
+  };
+
+  // 既存シフトの更新
+  const handleUpdateShift = async () => {
+    if (!editingId) return;
+    if (!newShift.date || !newShift.startTime || !newShift.endTime) return;
+
+    if (newShift.startTime >= newShift.endTime) {
+      alert('終了時刻は開始時刻より後にしてください');
+      return;
+    }
+
+    const dateShifts = getShiftsForDate(newShift.date).filter((s) => s.id !== editingId);
+    const hasOverlap = dateShifts.some((s) => !(newShift.endTime <= s.startTime || newShift.startTime >= s.endTime));
+    if (hasOverlap) {
+      alert('この時間帯は既にシフトが入っています');
+      return;
+    }
+
+    if (!canSubmitForDate(new Date(newShift.date))) {
+      alert('この日のシフトは締切を過ぎているため更新できません');
+      return;
+    }
+
+    // ローカル更新
+    setShifts((prev) => prev.map((s) => (s.id === editingId ? { ...s, ...newShift } : s)));
+
+    // Firestoreに保存済みなら更新
+    const target = shifts.find((s) => s.id === editingId);
+    try {
+      if (target?.persisted) {
+        const [y, m, d] = newShift.date.split('-').map((v) => parseInt(v, 10));
+        const dateTs = Timestamp.fromDate(new Date(y, m - 1, d, 0, 0, 0));
+        await updateDoc(doc(db, 'shifts', editingId), {
+          date: dateTs,
+          startTime: newShift.startTime,
+          endTime: newShift.endTime,
+          note: newShift.note ?? '',
+        });
+      }
+      setIsAddingShift(false);
+      setEditingId(null);
+    } catch (e) {
+      console.error(e);
+      alert('更新に失敗しました');
+    }
+  };
+
+  // シフト削除（即座にFirestoreから削除）
+  const handleDeleteShift = async (shiftId: string) => {
+    const shift = shifts.find((s) => s.id === shiftId);
+    if (!shift) return;
+
+    if (!canSubmitForDate(new Date(shift.date))) {
+      alert('この日のシフトは締切を過ぎているため削除できません');
+      return;
+    }
+
+    if (!confirm('このシフトを削除しますか？')) return;
+
+    try {
+      if (shift.persisted) {
+        await deleteDoc(doc(db, 'shifts', shiftId));
+      }
+      setShifts(shifts.filter((s) => s.id !== shiftId));
+      
+      // モーダルを閉じる
+      setIsAddingShift(false);
+      setEditingId(null);
+      setNewShift({
+        date: '',
+        startTime: '09:00',
+        endTime: '18:00',
+        note: '',
+      });
+    } catch (e) {
+      console.error(e);
+      alert('シフトの削除に失敗しました');
+    }
+  };
+
+  // ナビゲーション
+  const handlePrevious = () => {
+    const newDate = new Date(currentDate);
+    if (viewMode === 'day') {
+      newDate.setDate(newDate.getDate() - 1);
+    } else if (viewMode === 'week') {
+      newDate.setDate(newDate.getDate() - 7);
+    } else {
+      newDate.setMonth(newDate.getMonth() - 1);
+    }
+    setCurrentDate(newDate);
+    if (viewMode === 'month') {
+      setTargetMonth(newDate);
+    }
+  };
+
+  const handleNext = () => {
+    const newDate = new Date(currentDate);
+    if (viewMode === 'day') {
+      newDate.setDate(newDate.getDate() + 1);
+    } else if (viewMode === 'week') {
+      newDate.setDate(newDate.getDate() + 7);
+    } else {
+      newDate.setMonth(newDate.getMonth() + 1);
+    }
+    setCurrentDate(newDate);
+    if (viewMode === 'month') {
+      setTargetMonth(newDate);
+    }
+  };
+
+  const handleToday = () => {
+    const today = new Date();
+    setCurrentDate(today);
+    if (viewMode === 'month') {
+      setTargetMonth(today);
+    }
+  };
+
+  // 月表示
+  const renderMonthView = () => {
+    const days = getCalendarDays(currentDate);
+    const currentMonth = currentDate.getMonth();
+
+    return (
+      <div className="bg-white rounded-lg shadow">
+        <div className="grid grid-cols-7 border-b border-gray-300 border-opacity-50">
+          {['日', '月', '火', '水', '木', '金', '土'].map((day, index) => (
+            <div
+              key={day}
+              className={`p-3 text-center font-semibold border-r border-gray-300 border-opacity-50 last:border-r-0 ${
+                index === 0 ? 'text-red-600' : index === 6 ? 'text-blue-600' : ''
+              }`}
+            >
+              {day}
+            </div>
+          ))}
+        </div>
+        <div className="grid grid-cols-7">
+          {days.map((day, index) => {
+            const dateStr = formatDate(day);
+            const dayShifts = getShiftsForDate(dateStr);
+            const isCurrentMonth = day.getMonth() === currentMonth;
+            const isToday = isSameDate(day, new Date());
+            const holiday = JapaneseHolidays.isHoliday(day);
+            const dayOfWeek = day.getDay();
+            const isLockedDay = !canSubmitForDate(day);
+
+            return (
+              <div
+                key={index}
+                className={`min-h-24 p-2 border-r border-b border-gray-300 border-opacity-50 last:border-r-0 ${
+                  !isCurrentMonth ? 'bg-gray-50' : ''
+                } ${isToday ? 'bg-blue-50' : ''} ${isLockedDay ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-gray-100'}`}
+                title={isLockedDay ? 'この日のシフトは締切を過ぎています（前月25日12時）' : ''}
+                onClick={() => {
+                  setSelectedDate(dateStr);
+                  setNewShift({
+                    date: dateStr,
+                    startTime: '09:00',
+                    endTime: '18:00',
+                    note: '',
+                  });
+                  if (!isLockedDay) {
+                    setIsAddingShift(true);
+                  }
+                }}
+              >
+                <div className={`text-sm ${!isCurrentMonth ? 'text-gray-400' : holiday || dayOfWeek === 0 ? 'text-red-600' : dayOfWeek === 6 ? 'text-blue-600' : 'text-gray-900'} ${isToday ? 'font-bold' : ''}`}>
+                  {day.getDate()}
+                </div>
+                <div className="mt-1 space-y-1">
+                  {dayShifts.map(shift => (
+                    <button
+                      key={shift.id}
+                      className="w-full text-left text-xs bg-blue-100 text-blue-800 px-1 py-0.5 rounded truncate hover:bg-blue-200"
+                      title={`${shift.startTime}-${shift.endTime}${shift.note ? ': ' + shift.note : ''}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (!canSubmitForDate(new Date(shift.date))) return;
+                        setEditingId(shift.id!);
+                        setNewShift({
+                          date: shift.date,
+                          startTime: shift.startTime,
+                          endTime: shift.endTime,
+                          note: shift.note ?? '',
+                        });
+                        setIsAddingShift(true);
+                      }}
+                    >
+                      {shift.startTime}-{shift.endTime}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  // 週表示
+  const renderWeekView = () => {
+    const days = getWeekDays(currentDate);
+    const hours = getHourLabels();
+
+    return (
+      <div className="bg-white rounded-lg shadow overflow-x-auto">
+        <div className="grid grid-cols-8 min-w-max">
+          <div className="sticky left-0 bg-gray-50 border-r border-gray-300 border-opacity-50 z-10">
+            <div className="h-12 border-b border-gray-300 border-opacity-50"></div>
+            {hours.map(hour => (
+              <div key={hour} className="h-12 px-2 pt-1 text-sm text-gray-600 border-b border-gray-300 border-opacity-50 flex items-start">
+                {hour}
+              </div>
+            ))}
+          </div>
+          {days.map((day, dayIndex) => {
+            const dateStr = formatDate(day);
+            const dayShifts = getShiftsForDate(dateStr);
+            const isToday = isSameDate(day, new Date());
+            const dayOfWeek = day.getDay();
+            const holiday = JapaneseHolidays.isHoliday(day);
+            const isLockedDay = !canSubmitForDate(day);
+            const holidayName = holiday ? JapaneseHolidays.getHolidaysOf(day.getFullYear(), day.getMonth() + 1, day.getDate())[0]?.name : null;
+
+            return (
+              <div key={dayIndex} className="border-r border-gray-300 border-opacity-50 last:border-r-0 min-w-32">
+                <div className={`h-12 p-2 border-b border-gray-300 border-opacity-50 text-center ${isToday ? 'bg-blue-50 font-bold' : 'bg-gray-50'}`}>
+                  <div className={`text-xs ${
+                    holiday || dayOfWeek === 0 ? 'text-red-600' : dayOfWeek === 6 ? 'text-blue-600' : 'text-gray-600'
+                  }`}>
+                    {['日', '月', '火', '水', '木', '金', '土'][dayOfWeek]}
+                  </div>
+                  <div className={`text-sm ${
+                    holiday || dayOfWeek === 0 ? 'text-red-600' : dayOfWeek === 6 ? 'text-blue-600' : ''
+                  }`}>{day.getDate()}</div>
+                </div>
+                <div className="relative">
+                  {hours.map((hour, hourIndex) => (
+                    <div
+                      key={hour}
+                      className={`h-12 border-b border-gray-300 border-opacity-50 ${isLockedDay ? 'cursor-not-allowed' : 'hover:bg-gray-50 cursor-pointer'}`}
+                      title={isLockedDay ? 'この日のシフトは締切を過ぎています（前月25日12時）' : ''}
+                      onClick={() => {
+                        setSelectedDate(dateStr);
+                        setNewShift({
+                          date: dateStr,
+                          startTime: hour,
+                          endTime: `${(hourIndex + 1).toString().padStart(2, '0')}:00`,
+                          note: '',
+                        });
+                        if (!isLockedDay) {
+                          setIsAddingShift(true);
+                        }
+                      }}
+                    ></div>
+                  ))}
+                  {dayShifts.map(shift => {
+                    const startHour = parseInt(shift.startTime.split(':')[0]);
+                    const startMin = parseInt(shift.startTime.split(':')[1]);
+                    const endHour = parseInt(shift.endTime.split(':')[0]);
+                    const endMin = parseInt(shift.endTime.split(':')[1]);
+                    const top = (startHour + startMin / 60) * 48;
+                    const height = ((endHour + endMin / 60) - (startHour + startMin / 60)) * 48;
+
+                    return (
+                      <div
+                        key={shift.id}
+                        className={`absolute left-1 right-1 bg-blue-500 text-white text-xs p-1 rounded overflow-hidden ${!canSubmitForDate(new Date(shift.date)) ? 'opacity-70 cursor-not-allowed' : 'cursor-pointer'}`}
+                        style={{ top: `${top}px`, height: `${height}px` }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (!canSubmitForDate(new Date(shift.date))) return;
+                          setEditingId(shift.id!);
+                          setNewShift({
+                            date: shift.date,
+                            startTime: shift.startTime,
+                            endTime: shift.endTime,
+                            note: shift.note ?? '',
+                          });
+                          setIsAddingShift(true);
+                        }}
+                      >
+                        <div className="font-semibold">{shift.startTime}-{shift.endTime}</div>
+                        {shift.note && <div className="truncate">{shift.note}</div>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  // 日表示
+  const renderDayView = () => {
+    const dateStr = formatDate(currentDate);
+    const dayShifts = getShiftsForDate(dateStr);
+    const hours = getHourLabels();
+    const dayOfWeek = currentDate.getDay();
+    const holiday = JapaneseHolidays.isHoliday(currentDate);
+    const holidayName = holiday ? JapaneseHolidays.getHolidaysOf(currentDate.getFullYear(), currentDate.getMonth() + 1, currentDate.getDate())[0]?.name : null;
+    const isLockedDay = !canSubmitForDate(currentDate);
+
+    return (
+      <div className="bg-white rounded-lg shadow overflow-x-auto">
+        <div className="grid grid-cols-2 min-w-max">
+          <div className="sticky left-0 bg-gray-50 border-r border-gray-300 border-opacity-50">
+            <div className="h-12 border-b border-gray-300 border-opacity-50 p-2 text-center font-semibold">
+              時間
+            </div>
+            {hours.map(hour => (
+              <div key={hour} className="h-16 px-4 pt-1 text-sm text-gray-600 border-b border-gray-300 border-opacity-50 flex items-start">
+                {hour}
+              </div>
+            ))}
+          </div>
+          <div className="relative border-r border-gray-300 border-opacity-50">
+            <div className={`h-12 border-b border-gray-300 border-opacity-50 p-2 text-center font-semibold ${
+              holiday || dayOfWeek === 0 ? 'text-red-600' : dayOfWeek === 6 ? 'text-blue-600' : ''
+            }`}>
+              {currentDate.getMonth() + 1}月{currentDate.getDate()}日
+              (<span className={holiday || dayOfWeek === 0 ? 'text-red-600' : dayOfWeek === 6 ? 'text-blue-600' : ''}>{['日', '月', '火', '水', '木', '金', '土'][dayOfWeek]}</span>)
+            </div>
+            <div>
+              {hours.map((hour, hourIndex) => (
+                <div
+                  key={hour}
+                  className={`h-16 border-b border-gray-300 border-opacity-50 ${isLockedDay ? 'cursor-not-allowed' : 'hover:bg-gray-50 cursor-pointer'}`}
+                  title={isLockedDay ? 'この日のシフトは締切を過ぎています（前月25日12時）' : ''}
+                  onClick={() => {
+                    setSelectedDate(dateStr);
+                    setNewShift({
+                      date: dateStr,
+                      startTime: hour,
+                      endTime: `${(hourIndex + 1).toString().padStart(2, '0')}:00`,
+                      note: '',
+                    });
+                    if (!isLockedDay) {
+                      setIsAddingShift(true);
+                    }
+                  }}
+                ></div>
+              ))}
+              {dayShifts.map(shift => {
+                const startHour = parseInt(shift.startTime.split(':')[0]);
+                const startMin = parseInt(shift.startTime.split(':')[1]);
+                const endHour = parseInt(shift.endTime.split(':')[0]);
+                const endMin = parseInt(shift.endTime.split(':')[1]);
+                const top = (startHour + startMin / 60) * 64;
+                const height = ((endHour + endMin / 60) - (startHour + startMin / 60)) * 64;
+
+                return (
+                  <div
+                    key={shift.id}
+                    className={`absolute left-2 right-2 bg-blue-500 text-white p-2 rounded overflow-hidden ${!canSubmitForDate(new Date(shift.date)) ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'}`}
+                    title={!canSubmitForDate(new Date(shift.date)) ? 'このシフトは締切後のため編集できません' : ''}
+                    style={{ top: `${top + 48}px`, height: `${height}px` }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (!canSubmitForDate(new Date(shift.date))) return;
+                      setEditingId(shift.id!);
+                      setNewShift({
+                        date: shift.date,
+                        startTime: shift.startTime,
+                        endTime: shift.endTime,
+                        note: shift.note ?? '',
+                      });
+                      setIsAddingShift(true);
+                    }}
+                  >
+                    <div className="font-semibold">{shift.startTime}-{shift.endTime}</div>
+                    {shift.note && <div className="mt-1">{shift.note}</div>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <div className="max-w-7xl mx-auto px-4 py-6">
+        {/* ヘッダー */}
+        <div className="mb-6">
+          <div className="flex items-center justify-between mb-4">
+            <h1 className="text-3xl font-bold text-gray-900">シフト提出</h1>
+            <button
+              onClick={() => router.push('/dashboard/part-time')}
+              className="px-4 py-2 text-gray-600 hover:text-gray-900"
+            >
+              ← ダッシュボードに戻る
+            </button>
+          </div>
+
+          {/* 提出期限通知 */}
+          {!isSubmissionLocked ? (
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4">
+              <p className="text-sm text-blue-800">
+                📅 {getDeadlineMessageFor(displayDateForLock)}
+                （各月の提出期限は前月25日12時）
+              </p>
+            </div>
+          ) : (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4">
+              <p className="text-sm text-red-800">
+                🔒 {getDeadlineMessageFor(displayDateForLock)}
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* コントロールバー */}
+        <div className="bg-white rounded-lg shadow p-4 mb-6">
+          <div className="flex items-center justify-between flex-wrap gap-4">
+            {/* ナビゲーション */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handlePrevious}
+                className="px-3 py-2 border border-gray-300 rounded-md hover:bg-gray-50"
+              >
+                ←
+              </button>
+              <button
+                onClick={handleToday}
+                className="px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50"
+              >
+                今日
+              </button>
+              <button
+                onClick={handleNext}
+                className="px-3 py-2 border border-gray-300 rounded-md hover:bg-gray-50"
+              >
+                →
+              </button>
+              <h2 className="ml-4 text-xl font-semibold">
+                {currentDate.getFullYear()}年{currentDate.getMonth() + 1}月
+                {viewMode === 'day' && `${currentDate.getDate()}日`}
+              </h2>
+            </div>
+
+            {/* 表示モード切替 */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setViewMode('day')}
+                className={`px-4 py-2 rounded-md ${
+                  viewMode === 'day'
+                    ? 'bg-blue-500 text-white'
+                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                }`}
+              >
+                日
+              </button>
+              <button
+                onClick={() => setViewMode('week')}
+                className={`px-4 py-2 rounded-md ${
+                  viewMode === 'week'
+                    ? 'bg-blue-500 text-white'
+                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                }`}
+              >
+                週
+              </button>
+              <button
+                onClick={() => setViewMode('month')}
+                className={`px-4 py-2 rounded-md ${
+                  viewMode === 'month'
+                    ? 'bg-blue-500 text-white'
+                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                }`}
+              >
+                月
+              </button>
+            </div>
+
+            {/* シフト統計 */}
+            <div className="text-sm text-gray-600">
+              登録シフト: {shifts.length}件
+            </div>
+          </div>
+        </div>
+
+        {/* カレンダー表示 */}
+        {viewMode === 'month' && renderMonthView()}
+        {viewMode === 'week' && renderWeekView()}
+        {viewMode === 'day' && renderDayView()}
+
+        {/* シフト追加モーダル */}
+        {isAddingShift && (
+          <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+            <div className="bg-white rounded-lg p-6 w-full max-w-md">
+              <h3 className="text-xl font-bold mb-4">{editingId ? 'シフトを編集' : 'シフトを追加'}</h3>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    日付
+                  </label>
+                  <input
+                    type="date"
+                    value={newShift.date}
+                    onChange={(e) => setNewShift({ ...newShift, date: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      開始時刻
+                    </label>
+                    <input
+                      type="time"
+                      value={newShift.startTime}
+                      onChange={(e) => setNewShift({ ...newShift, startTime: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      終了時刻
+                    </label>
+                    <input
+                      type="time"
+                      value={newShift.endTime}
+                      onChange={(e) => setNewShift({ ...newShift, endTime: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    備考（任意）
+                  </label>
+                  <textarea
+                    value={newShift.note}
+                    onChange={(e) => setNewShift({ ...newShift, note: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                    rows={3}
+                    placeholder="特記事項があれば入力してください"
+                  />
+                </div>
+              </div>
+              <div className="mt-6 flex gap-3">
+                {editingId ? (
+                  <>
+                    <button
+                      onClick={handleUpdateShift}
+                      className="flex-1 px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700"
+                    >
+                      更新
+                    </button>
+                    <button
+                      onClick={() => handleDeleteShift(editingId)}
+                      className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700"
+                    >
+                      削除
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={handleSaveShift}
+                    className="flex-1 px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600"
+                  >
+                    追加
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    setIsAddingShift(false);
+                    setEditingId(null);
+                    setNewShift({
+                      date: '',
+                      startTime: '09:00',
+                      endTime: '18:00',
+                      note: '',
+                    });
+                  }}
+                  className="flex-1 px-4 py-2 bg-gray-200 text-gray-700 rounded-md hover:bg-gray-300"
+                >
+                  キャンセル
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

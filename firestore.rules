@@ -1,0 +1,104 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function currentUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isMember(orgId) {
+      let userData = currentUserData();
+      return 'organizationIds' in userData &&
+             userData.organizationIds != null &&
+             userData.organizationIds.hasAny([orgId]);
+    }
+
+    function isManage() {
+      return currentUserData().isManage == true;
+    }
+    
+    // ユーザーコレクション
+    match /users/{userId} {
+      // 読み取り: 自分 or （管理者 かつ 同一組織のメンバーのユーザー）
+      allow read: if signedIn() && (
+        request.auth.uid == userId || (
+          isManage() &&
+          // 対象ユーザーの所属組織に、現在ユーザーのcurrentOrganizationIdが含まれている
+          ('organizationIds' in resource.data) &&
+          (currentUserData().currentOrganizationId != null) &&
+          (currentUserData().currentOrganizationId in resource.data.organizationIds) &&
+          // 自分自身もその組織のメンバーであること
+          isMember(currentUserData().currentOrganizationId)
+        )
+      );
+
+      // 書き込み: 自分のドキュメントのみ
+      allow write: if signedIn() && request.auth.uid == userId;
+    }
+    
+    // 組織コレクション
+    match /organizations/{organizationId} {
+      // 認証済みユーザーは作成可能
+      allow create: if signedIn();
+      
+      // 認証済みユーザーは読み取り可能（組織IDを確認するため）
+      allow read: if signedIn();
+      
+      // 自分が管理者の組織は更新・削除可能
+      allow update, delete: if signedIn() &&
+                               isMember(organizationId) &&
+                               isManage();
+    }
+    
+    // シフトコレクション
+    match /shifts/{shiftId} {
+      // 読み取り: ログイン済み & 同じ組織のメンバー
+      allow read: if signedIn() && isMember(resource.data.organizationId);
+
+      // 作成: ログイン済み & 所属組織のシフト & 自分のuserRef
+      // デバッグ用に条件を分けて記述
+      allow create: if signedIn() &&
+                      request.resource.data.userRef == /databases/$(database)/documents/users/$(request.auth.uid) &&
+                      isMember(request.resource.data.organizationId);
+
+      // 更新:
+      // - 管理者: 同一組織内なら更新可（承認/却下操作を想定）
+      // - 本人: statusがpendingの間のみ、かつstatus/organizationId/userRefを変更不可
+      allow update: if signedIn() && isMember(resource.data.organizationId) && (
+                      isManage() || (
+                        resource.data.userRef == /databases/$(database)/documents/users/$(request.auth.uid) &&
+                        (!('status' in resource.data) || resource.data.status == 'pending') &&
+                        request.resource.data.status == resource.data.status &&
+                        request.resource.data.organizationId == resource.data.organizationId &&
+                        request.resource.data.userRef == resource.data.userRef
+                      )
+                    );
+
+      // 削除: 管理者は可。本人はstatusがpendingのときのみ可（未設定はpending扱い）
+      allow delete: if signedIn() && isMember(resource.data.organizationId) && (
+                      isManage() || (
+                        resource.data.userRef == /databases/$(database)/documents/users/$(request.auth.uid) &&
+                        (!('status' in resource.data) || resource.data.status == 'pending')
+                      )
+                    );
+    }
+    
+    // タイムカードコレクション
+    match /timecards/{timecardId} {
+      // 自分が所属する組織のタイムカードは読み取り可能
+      allow read: if signedIn() && isMember(resource.data.organizationId);
+      
+      // アルバイトは自分のタイムカードを作成・更新可能
+      allow create, update: if signedIn() && 
+                               request.auth.uid == request.resource.data.userId &&
+                               isMember(request.resource.data.organizationId);
+      
+      // 管理者は同じ組織のタイムカードを更新・削除可能
+      allow update, delete: if signedIn() && isMember(resource.data.organizationId) && isManage();
+    }
+  }
+}
