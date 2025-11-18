@@ -115,7 +115,7 @@ export default function CompanyDashboard() {
           <div className="bg-white rounded-lg shadow p-6">
             <h2 className="text-lg font-semibold text-gray-900 mb-4">スタッフ管理</h2>
             <p className="text-gray-600 mb-4">アルバイトスタッフの管理</p>
-            <button className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition">
+            <button onClick={() => router.push('/organization/members')} className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition">
               スタッフ一覧
             </button>
           </div>
@@ -133,7 +133,7 @@ export default function CompanyDashboard() {
           <div className="bg-white rounded-lg shadow p-6">
             <h2 className="text-lg font-semibold text-gray-900 mb-4">給与計算</h2>
             <p className="text-gray-600 mb-4">スタッフの給与を計算</p>
-            <button className="w-full px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 transition">
+            <button onClick={() => router.push('/payroll')} className="w-full px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 transition">
               給与計算
             </button>
           </div>
@@ -160,7 +160,7 @@ export default function CompanyDashboard() {
           <div className="bg-white rounded-lg shadow p-6">
             <h2 className="text-lg font-semibold text-gray-900 mb-4">設定</h2>
             <p className="text-gray-600 mb-4">企業情報の編集</p>
-            <button className="w-full px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition">
+            <button onClick={() => router.push('/organization/settings')} className="w-full px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition">
               設定
             </button>
           </div>

@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
-import { collection, doc, serverTimestamp, query, where, getDocs, updateDoc, addDoc, deleteDoc, orderBy } from 'firebase/firestore';
+import { collection, doc, serverTimestamp, query, where, getDocs, updateDoc, addDoc, deleteDoc, orderBy, getDoc } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { Timestamp } from 'firebase/firestore';
 import JapaneseHolidays from 'japanese-holidays';
@@ -17,6 +17,7 @@ interface ShiftEntry {
   endTime: string; // HH:mm
   note?: string;
   persisted?: boolean;
+  status?: string; // 'pending' | 'approved' | 'rejected'
 }
 
 export default function ShiftSubmitPage() {
@@ -26,6 +27,7 @@ export default function ShiftSubmitPage() {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [targetMonth, setTargetMonth] = useState(new Date());
   const [shifts, setShifts] = useState<ShiftEntry[]>([]);
+  const [statusFilter, setStatusFilter] = useState<'all' | 'approved' | 'pending' | 'rejected'>('all');
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [isAddingShift, setIsAddingShift] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -35,17 +37,20 @@ export default function ShiftSubmitPage() {
     endTime: '18:00',
     note: '',
   });
+  const [orgDefaultHourlyWage, setOrgDefaultHourlyWage] = useState<number>(1100);
+  const [shiftSubmissionEnforced, setShiftSubmissionEnforced] = useState<boolean>(false);
+  const [shiftSubmissionMinDaysBefore, setShiftSubmissionMinDaysBefore] = useState<number>(0);
 
 
 
-  // 提出期限チェック（各ターゲット月の直前月25日12時まで）
+  // 提出期限チェック（組織設定: シフト日からX日前まで）
   const canSubmitForMonth = (targetDate: Date): boolean => {
+    if (!shiftSubmissionEnforced) return true;
     const now = new Date();
-    const targetYear = targetDate.getFullYear();
-    const targetMonth = targetDate.getMonth();
-    // ターゲット月の直前月25日12:00が締切
-    // 例：11月の締切は10/25 12:00、1月の締切は前年12/25 12:00
-    const deadline = new Date(targetYear, targetMonth - 1, 25, 12, 0, 0);
+    const deadline = new Date(targetDate);
+    deadline.setDate(deadline.getDate() - shiftSubmissionMinDaysBefore);
+    // その日の0:00締切
+    deadline.setHours(0, 0, 0, 0);
     return now.getTime() <= deadline.getTime();
   };
 
@@ -60,21 +65,18 @@ export default function ShiftSubmitPage() {
 
   // 提出期限までの残り時間を表示（基準となる日付を引数に取る）
   const getDeadlineMessageFor = (baseDate: Date): string => {
+    if (!shiftSubmissionEnforced) return '提出締切は無効です（企業設定で有効化すると適用されます）';
     const now = new Date();
-    const y = baseDate.getFullYear();
-    const m = baseDate.getMonth();
-    const deadline = new Date(y, m - 1, 25, 12, 0, 0);
-
+    const deadline = new Date(baseDate);
+    deadline.setDate(deadline.getDate() - shiftSubmissionMinDaysBefore);
+    deadline.setHours(0, 0, 0, 0);
     if (now.getTime() > deadline.getTime()) {
-      const displayY = y;
-      const displayM = m + 1; // 人間向け表示
-      return `${displayY}年${displayM}月の提出期限（前月25日12時）は過ぎています`;
+      return `この期間の提出期限（シフト日の${shiftSubmissionMinDaysBefore}日前 0:00）は過ぎています`;
     }
-
     const diffMs = deadline.getTime() - now.getTime();
     const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
     const diffHours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-    return `提出期限（前月25日12時）まで残り${diffDays}日${diffHours}時間`;
+    return `提出期限（シフト日の${shiftSubmissionMinDaysBefore}日前 0:00）まで残り${diffDays}日${diffHours}時間`;
   };
 
   useEffect(() => {
@@ -88,6 +90,20 @@ export default function ShiftSubmitPage() {
     if (!belongs) {
       router.push('/join-organization');
     }
+    // 組織設定の読込（デフォルト時給/提出締切）
+    const loadOrgSettings = async () => {
+      try {
+        const orgSnap = await getDoc(doc(db, 'organizations', orgId));
+        const org = orgSnap.exists() ? (orgSnap.data() as any) : {};
+        const hourly = org.defaultHourlyWage != null ? Number(org.defaultHourlyWage) : 1100;
+        if (!Number.isNaN(hourly) && hourly > 0) setOrgDefaultHourlyWage(hourly);
+        setShiftSubmissionEnforced(!!org.shiftSubmissionEnforced);
+        setShiftSubmissionMinDaysBefore(Number(org.shiftSubmissionMinDaysBefore ?? 0));
+      } catch (e) {
+        console.warn('[Shift Submit] failed to load org settings', e);
+      }
+    };
+    loadOrgSettings();
   }, [userProfile, router]);
 
   // 表示月のシフトを読み込む関数
@@ -127,6 +143,7 @@ export default function ShiftSubmitPage() {
           endTime: data.endTime,
           note: data.note || '',
           persisted: true,
+          status: data.status || 'pending',
         } as ShiftEntry;
       })
       ;
@@ -176,6 +193,23 @@ export default function ShiftSubmitPage() {
   // 時間軸の配列を生成（0-23時）
   const getHourLabels = (): string[] => {
     return Array.from({ length: 24 }, (_, i) => `${i.toString().padStart(2, '0')}:00`);
+  };
+
+  // ステータスフィルター適用
+  const matchesFilter = (s: ShiftEntry) => statusFilter === 'all' || (s.status ?? 'pending') === statusFilter;
+
+  // ステータス別クラス（承認=緑／申請中=灰／却下=赤）
+  const classesForStatus = (status: string | undefined, kind: 'month' | 'block') => {
+    const st = status ?? 'pending';
+    if (kind === 'month') {
+      if (st === 'approved') return 'bg-green-100 text-green-800 hover:bg-green-200';
+      if (st === 'rejected') return 'bg-red-100 text-red-800 hover:bg-red-200';
+      return 'bg-gray-100 text-gray-800 hover:bg-gray-200'; // pending
+    } else {
+      if (st === 'approved') return 'bg-green-500 text-white';
+      if (st === 'rejected') return 'bg-red-500 text-white';
+      return 'bg-gray-500 text-white'; // pending
+    }
   };
 
   // 日付文字列をフォーマット
@@ -272,6 +306,7 @@ export default function ShiftSubmitPage() {
         startTime: newShift.startTime,
         endTime: newShift.endTime,
         note: newShift.note ?? '',
+        hourlyWage: orgDefaultHourlyWage,
         status: 'pending',
         approvedBy: null,
         approvedAt: null,
@@ -281,7 +316,7 @@ export default function ShiftSubmitPage() {
       console.log('[Debug] Shift created successfully:', docRef.id);
 
       // ローカル状態に反映
-      setShifts([...shifts, { ...newShift, id: docRef.id, persisted: true }]);
+      setShifts([...shifts, { ...newShift, id: docRef.id, persisted: true, status: 'pending' }]);
       setIsAddingShift(false);
       setNewShift({
         date: '',
@@ -317,13 +352,15 @@ export default function ShiftSubmitPage() {
       return;
     }
 
-    // ローカル更新
-    setShifts((prev) => prev.map((s) => (s.id === editingId ? { ...s, ...newShift } : s)));
-
     // Firestoreに保存済みなら更新
     const target = shifts.find((s) => s.id === editingId);
     try {
       if (target?.persisted) {
+        // 承認済み・却下済みは編集不可
+        if (target.status && target.status !== 'pending') {
+          alert('このシフトは承認済みまたは却下済みのため編集できません');
+          return;
+        }
         const [y, m, d] = newShift.date.split('-').map((v) => parseInt(v, 10));
         const dateTs = Timestamp.fromDate(new Date(y, m - 1, d, 0, 0, 0));
         await updateDoc(doc(db, 'shifts', editingId), {
@@ -332,12 +369,19 @@ export default function ShiftSubmitPage() {
           endTime: newShift.endTime,
           note: newShift.note ?? '',
         });
+        // 成功時のみローカル反映
+        setShifts((prev) => prev.map((s) => (s.id === editingId ? { ...s, ...newShift } : s)));
+      } else {
+        // 未保存（ローカルのみ）の場合はローカル更新
+        setShifts((prev) => prev.map((s) => (s.id === editingId ? { ...s, ...newShift } : s)));
       }
       setIsAddingShift(false);
       setEditingId(null);
     } catch (e) {
       console.error(e);
       alert('更新に失敗しました');
+      // Firestore失敗時はサーバー状態を優先し再読込
+      await loadMonthShifts(currentDate);
     }
   };
 
@@ -435,7 +479,7 @@ export default function ShiftSubmitPage() {
         <div className="grid grid-cols-7">
           {days.map((day, index) => {
             const dateStr = formatDate(day);
-            const dayShifts = getShiftsForDate(dateStr);
+            const dayShifts = getShiftsForDate(dateStr).filter(matchesFilter);
             const isCurrentMonth = day.getMonth() === currentMonth;
             const isToday = isSameDate(day, new Date());
             const holiday = JapaneseHolidays.isHoliday(day);
@@ -469,7 +513,7 @@ export default function ShiftSubmitPage() {
                   {dayShifts.map(shift => (
                     <button
                       key={shift.id}
-                      className="w-full text-left text-xs bg-blue-100 text-blue-800 px-1 py-0.5 rounded truncate hover:bg-blue-200"
+                      className={`w-full text-left text-xs px-1 py-0.5 rounded truncate ${classesForStatus(shift.status, 'month')}`}
                       title={`${shift.startTime}-${shift.endTime}${shift.note ? ': ' + shift.note : ''}`}
                       onClick={(e) => {
                         e.stopPropagation();
@@ -514,7 +558,7 @@ export default function ShiftSubmitPage() {
           </div>
           {days.map((day, dayIndex) => {
             const dateStr = formatDate(day);
-            const dayShifts = getShiftsForDate(dateStr);
+            const dayShifts = getShiftsForDate(dateStr).filter(matchesFilter);
             const isToday = isSameDate(day, new Date());
             const dayOfWeek = day.getDay();
             const holiday = JapaneseHolidays.isHoliday(day);
@@ -564,7 +608,7 @@ export default function ShiftSubmitPage() {
                     return (
                       <div
                         key={shift.id}
-                        className={`absolute left-1 right-1 bg-blue-500 text-white text-xs p-1 rounded overflow-hidden ${!canSubmitForDate(new Date(shift.date)) ? 'opacity-70 cursor-not-allowed' : 'cursor-pointer'}`}
+                        className={`absolute left-1 right-1 ${classesForStatus(shift.status, 'block')} text-xs p-1 rounded overflow-hidden ${!canSubmitForDate(new Date(shift.date)) ? 'opacity-70 cursor-not-allowed' : 'cursor-pointer'}`}
                         style={{ top: `${top}px`, height: `${height}px` }}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -596,7 +640,7 @@ export default function ShiftSubmitPage() {
   // 日表示
   const renderDayView = () => {
     const dateStr = formatDate(currentDate);
-    const dayShifts = getShiftsForDate(dateStr);
+    const dayShifts = getShiftsForDate(dateStr).filter(matchesFilter);
     const hours = getHourLabels();
     const dayOfWeek = currentDate.getDay();
     const holiday = JapaneseHolidays.isHoliday(currentDate);
@@ -654,7 +698,7 @@ export default function ShiftSubmitPage() {
                 return (
                   <div
                     key={shift.id}
-                    className={`absolute left-2 right-2 bg-blue-500 text-white p-2 rounded overflow-hidden ${!canSubmitForDate(new Date(shift.date)) ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'}`}
+                    className={`absolute left-2 right-2 ${classesForStatus(shift.status, 'block')} p-2 rounded overflow-hidden ${!canSubmitForDate(new Date(shift.date)) ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'}`}
                     title={!canSubmitForDate(new Date(shift.date)) ? 'このシフトは締切後のため編集できません' : ''}
                     style={{ top: `${top + 48}px`, height: `${height}px` }}
                     onClick={(e) => {
@@ -700,16 +744,11 @@ export default function ShiftSubmitPage() {
           {/* 提出期限通知 */}
           {!isSubmissionLocked ? (
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4">
-              <p className="text-sm text-blue-800">
-                📅 {getDeadlineMessageFor(displayDateForLock)}
-                （各月の提出期限は前月25日12時）
-              </p>
+              <p className="text-sm text-blue-800">📅 {getDeadlineMessageFor(displayDateForLock)}</p>
             </div>
           ) : (
             <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4">
-              <p className="text-sm text-red-800">
-                🔒 {getDeadlineMessageFor(displayDateForLock)}
-              </p>
+              <p className="text-sm text-red-800">🔒 {getDeadlineMessageFor(displayDateForLock)}</p>
             </div>
           )}
         </div>
@@ -741,6 +780,21 @@ export default function ShiftSubmitPage() {
                 {currentDate.getFullYear()}年{currentDate.getMonth() + 1}月
                 {viewMode === 'day' && `${currentDate.getDate()}日`}
               </h2>
+            </div>
+
+            {/* ステータスフィルター */}
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-gray-700">ステータス</label>
+              <select
+                className="px-3 py-2 border border-gray-300 rounded-md bg-white text-sm"
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value as any)}
+              >
+                <option value="all">全て</option>
+                <option value="approved">承認済み</option>
+                <option value="pending">申請中</option>
+                <option value="rejected">却下済み</option>
+              </select>
             </div>
 
             {/* 表示モード切替 */}

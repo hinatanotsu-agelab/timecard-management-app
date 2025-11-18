@@ -22,6 +22,23 @@ export interface Organization {
   createdBy: string; // 作成者のUID
   createdAt: Timestamp;
   updatedAt: Timestamp;
+  // 給与設定
+  defaultHourlyWage?: number; // デフォルト時給（円）
+  nightPremiumEnabled?: boolean; // 深夜割増を適用するか
+  nightPremiumRate?: number; // 深夜割増率（例: 0.25 = 25%）
+  nightStart?: string; // 深夜開始時刻 (HH:mm)
+  nightEnd?: string; // 深夜終了時刻 (HH:mm)
+  // 残業割増
+  overtimePremiumEnabled?: boolean; // 残業割増を適用するか
+  overtimePremiumRate?: number; // 残業割増率（例: 0.25 = 25%）
+  overtimeDailyThresholdMinutes?: number; // 1日あたり閾値（分）例: 480 = 8時間
+  // 休日割増
+  holidayPremiumEnabled?: boolean; // 休日割増を適用するか
+  holidayPremiumRate?: number; // 休日割増率（例: 0.35 = 35%）
+  holidayIncludesWeekend?: boolean; // 休日に土日を含める
+  // 交通費
+  transportAllowanceEnabled?: boolean; // 交通費を支給するか
+  transportAllowancePerShift?: number; // 1シフトあたり交通費（円）
 }
 
 // シフト情報

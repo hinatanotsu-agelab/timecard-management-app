@@ -2,6 +2,9 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    function orgData(orgId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)).data;
+    }
     function signedIn() {
       return request.auth != null;
     }
@@ -21,23 +24,51 @@ service cloud.firestore {
       return currentUserData().isManage == true;
     }
     
+    function submissionAllowed(orgId, shiftTs) {
+      let o = orgData(orgId);
+      let enforced = ("shiftSubmissionEnforced" in o) && (o.shiftSubmissionEnforced == true);
+      let days = ("shiftSubmissionMinDaysBefore" in o) ? o.shiftSubmissionMinDaysBefore : 0;
+      // 管理者は常に許可 / 無効時は許可 / 有効時は request.time + days <= shiftTs
+      return isManage() || !enforced || (request.time + duration.value(days, 'd') <= shiftTs);
+    }
+    
     // ユーザーコレクション
     match /users/{userId} {
-      // 読み取り: 自分 or （管理者 かつ 同一組織のメンバーのユーザー）
+      // 読み取り: 自分 or （同一組織のメンバーのユーザー）
       allow read: if signedIn() && (
         request.auth.uid == userId || (
-          isManage() &&
           // 対象ユーザーの所属組織に、現在ユーザーのcurrentOrganizationIdが含まれている
           ('organizationIds' in resource.data) &&
           (currentUserData().currentOrganizationId != null) &&
-          (currentUserData().currentOrganizationId in resource.data.organizationIds) &&
+          resource.data.organizationIds.hasAny([currentUserData().currentOrganizationId]) &&
           // 自分自身もその組織のメンバーであること
           isMember(currentUserData().currentOrganizationId)
         )
       );
 
-      // 書き込み: 自分のドキュメントのみ
-      allow write: if signedIn() && request.auth.uid == userId;
+      // 作成: 自分のドキュメントのみ
+      allow create: if signedIn() && request.auth.uid == userId;
+
+      // 更新: 自分のドキュメント もしくは 管理者による所属組織の解除のみ許可
+      allow update: if signedIn() && (
+        // 自分自身の更新は許可
+        request.auth.uid == userId || (
+          // 管理者による、現在の組織からターゲットユーザーを外す更新のみ許可
+          isManage() &&
+          currentUserData().currentOrganizationId != null &&
+          isMember(currentUserData().currentOrganizationId) &&
+          // 対象ユーザーがその組織に所属していること
+          ('organizationIds' in resource.data) &&
+          resource.data.organizationIds != null &&
+          resource.data.organizationIds.hasAny([currentUserData().currentOrganizationId]) &&
+          // 変更はorganizationIdsのみに限定
+          request.resource.data.diff(resource.data).changedKeys().hasOnly(['organizationIds']) &&
+          // サイズは1だけ減少（=追加は不可）
+          request.resource.data.organizationIds.size() == resource.data.organizationIds.size() - 1 &&
+          // 更新後に currentOrganizationId が含まれていないこと（=その組織からの除外）
+          !request.resource.data.organizationIds.hasAny([currentUserData().currentOrganizationId])
+        )
+      );
     }
     
     // 組織コレクション
@@ -52,6 +83,14 @@ service cloud.firestore {
       allow update, delete: if signedIn() &&
                                isMember(organizationId) &&
                                isManage();
+
+      // 組織配下: メンバー個別設定（例: 交通費）
+      match /members/{userId} {
+        // 読み取り: 管理者かつ同一組織のメンバー
+        allow read: if signedIn() && isMember(organizationId) && isManage();
+        // 書き込み: 管理者かつ同一組織のメンバー
+        allow create, update, delete: if signedIn() && isMember(organizationId) && isManage();
+      }
     }
     
     // シフトコレクション
@@ -62,8 +101,9 @@ service cloud.firestore {
       // 作成: ログイン済み & 所属組織のシフト & 自分のuserRef
       // デバッグ用に条件を分けて記述
       allow create: if signedIn() &&
-                      request.resource.data.userRef == /databases/$(database)/documents/users/$(request.auth.uid) &&
-                      isMember(request.resource.data.organizationId);
+              request.resource.data.userRef == /databases/$(database)/documents/users/$(request.auth.uid) &&
+              isMember(request.resource.data.organizationId) &&
+              submissionAllowed(request.resource.data.organizationId, request.resource.data.date);
 
       // 更新:
       // - 管理者: 同一組織内なら更新可（承認/却下操作を想定）
@@ -74,7 +114,8 @@ service cloud.firestore {
                         (!('status' in resource.data) || resource.data.status == 'pending') &&
                         request.resource.data.status == resource.data.status &&
                         request.resource.data.organizationId == resource.data.organizationId &&
-                        request.resource.data.userRef == resource.data.userRef
+                        request.resource.data.userRef == resource.data.userRef &&
+                        submissionAllowed(resource.data.organizationId, request.resource.data.date)
                       )
                     );
 
@@ -82,7 +123,8 @@ service cloud.firestore {
       allow delete: if signedIn() && isMember(resource.data.organizationId) && (
                       isManage() || (
                         resource.data.userRef == /databases/$(database)/documents/users/$(request.auth.uid) &&
-                        (!('status' in resource.data) || resource.data.status == 'pending')
+                        (!('status' in resource.data) || resource.data.status == 'pending') &&
+                        submissionAllowed(resource.data.organizationId, resource.data.date)
                       )
                     );
     }
