@@ -1,6 +1,4 @@
-'use client';
-
-import { useEffect, useMemo, useState } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { collection, doc, getDoc, getDocs, query, updateDoc, where, setDoc, deleteDoc, Timestamp, arrayRemove } from 'firebase/firestore';
@@ -17,6 +15,12 @@ interface MemberRow {
 }
 
 export default function OrganizationMembersPage() {
+    // 新規ユーザー追加用のstate（関数コンポーネント内に移動）
+    const [newUserEmail, setNewUserEmail] = useState('');
+    const [newUserPassword, setNewUserPassword] = useState('');
+    const [newUserDisplayName, setNewUserDisplayName] = useState('');
+    const [adding, setAdding] = useState(false);
+    const [showAddUser, setShowAddUser] = useState(false);
   const { userProfile } = useAuth();
   const router = useRouter();
   const [loading, setLoading] = useState(true);

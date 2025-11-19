@@ -74,7 +74,13 @@ export default function JoinOrganizationPage() {
         currentOrganizationId: inputId,
         updatedAt: Timestamp.now(),
       });
-      console.log('[Join Organization] Update successful, navigating to dashboard/part-time');
+      console.log('[Join Organization] Update successful, refreshing userProfile...');
+      if (typeof updateUserProfile === 'function') {
+        await updateUserProfile({
+          organizationIds: newOrgIds,
+          currentOrganizationId: inputId,
+        });
+      }
       router.push('/dashboard/part-time');
     } catch (err: any) {
       console.error('[Join Organization] Error:', err);
